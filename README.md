@@ -1,5 +1,9 @@
 # vertex-ai-rag-pipeline
 
+[![CI](https://github.com/shubhambakre/vertex-ai-rag-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/shubhambakre/vertex-ai-rag-pipeline/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A Retrieval-Augmented Generation (RAG) pipeline on Google Cloud Platform. Ingests documents into **BigQuery Vector Search**, embeds queries with **Vertex AI text-embedding-004**, retrieves semantically relevant chunks, and generates grounded answers with **Gemini 1.5 Pro**.
 
 No external vector database required — BigQuery handles both structured data and vector search in the same platform.
