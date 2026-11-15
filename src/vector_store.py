@@ -12,7 +12,7 @@ from google.oauth2 import service_account
 class BigQueryVectorStore:
     """
     Stores document embeddings in BigQuery and retrieves them via
-    the VECTOR_SEARCH function with cosine similarity.
+    the VECTOR_SEARCH function with cosine similarity and hybrid search.
 
     Table schema:
         id        STRING   — unique chunk ID
@@ -122,6 +122,7 @@ class BigQueryVectorStore:
     ) -> list[dict]:
         """
         Retrieve the top-k most semantically similar chunks via VECTOR_SEARCH.
+        Uses safe BigQuery array parameters rather than raw string interpolation.
 
         Args:
             query_embedding: Dense embedding of the user query.
@@ -131,9 +132,6 @@ class BigQueryVectorStore:
             List of dicts: {id, content, source, metadata, distance}
             Ordered by ascending cosine distance (closer = more relevant).
         """
-        # BigQuery expects the query embedding as a subquery returning the same
-        # column name as the indexed field.
-        embedding_literal = json.dumps(query_embedding)
         query = f"""
         SELECT
             base.id,
@@ -145,13 +143,19 @@ class BigQueryVectorStore:
             VECTOR_SEARCH(
                 TABLE `{self.full_table_id}`,
                 'embedding',
-                (SELECT {embedding_literal} AS embedding),
-                top_k          => {top_k},
+                (SELECT @query_embedding AS embedding),
+                top_k          => @top_k,
                 distance_type  => 'COSINE'
             )
         ORDER BY distance ASC
         """
-        results = self.client.query(query).result()
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("query_embedding", "FLOAT64", query_embedding),
+                bigquery.ScalarQueryParameter("top_k", "INT64", top_k),
+            ]
+        )
+        results = self.client.query(query, job_config=job_config).result()
         return [
             {
                 "id": row.id,
@@ -162,6 +166,81 @@ class BigQueryVectorStore:
             }
             for row in results
         ]
+
+    def hybrid_search(
+        self,
+        query_text: str,
+        query_embedding: list[float],
+        top_k: int = 5,
+        rrf_k: int = 60,
+    ) -> list[dict]:
+        """
+        Dual-stage hybrid retrieval combining lexical keyword search and semantic
+        vector search, unified via Reciprocal Rank Fusion (RRF, k=60).
+
+        Args:
+            query_text: The user's search query for lexical filtering.
+            query_embedding: Dense embedding vector for semantic search.
+            top_k: Final number of ranked results to return.
+            rrf_k: Smoothing constant for reciprocal rank fusion (default 60).
+        """
+        # 1. Semantic vector candidates (fetch top_k * 2)
+        semantic_results = self.similarity_search(query_embedding, top_k=top_k * 2)
+
+        # 2. Lexical keyword candidates
+        lexical_query = f"""
+        SELECT
+            id,
+            content,
+            source,
+            metadata
+        FROM
+            `{self.full_table_id}`
+        WHERE
+            LOWER(content) LIKE CONCAT('%', LOWER(@term), '%')
+        LIMIT @limit
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("term", "STRING", query_text),
+                bigquery.ScalarQueryParameter("limit", "INT64", top_k * 2),
+            ]
+        )
+        lexical_results = [
+            {
+                "id": row.id,
+                "content": row.content,
+                "source": row.source,
+                "metadata": json.loads(row.metadata or "{}"),
+                "distance": 0.5,
+            }
+            for row in self.client.query(lexical_query, job_config=job_config).result()
+        ]
+
+        # 3. Reciprocal Rank Fusion (RRF)
+        scores: dict[str, float] = {}
+        doc_map: dict[str, dict] = {}
+
+        for rank, doc in enumerate(semantic_results, start=1):
+            doc_id = doc["id"]
+            doc_map[doc_id] = doc
+            scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (rrf_k + rank))
+
+        for rank, doc in enumerate(lexical_results, start=1):
+            doc_id = doc["id"]
+            if doc_id not in doc_map:
+                doc_map[doc_id] = doc
+            scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (rrf_k + rank))
+
+        # Rank documents by descending RRF score
+        ranked_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)[:top_k]
+        fused_results = []
+        for doc_id in ranked_ids:
+            item = dict(doc_map[doc_id])
+            item["rrf_score"] = round(scores[doc_id], 6)
+            fused_results.append(item)
+
+        return fused_results
 
     def count_documents(self) -> int:
         """Return the number of chunks currently stored."""

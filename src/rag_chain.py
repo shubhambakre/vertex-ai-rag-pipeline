@@ -32,7 +32,7 @@ class RAGChain:
     """
     End-to-end RAG pipeline:
       1. Embed the user query (Vertex AI text-embedding-004)
-      2. Retrieve top-k semantically similar chunks (BigQuery VECTOR_SEARCH)
+      2. Retrieve top-k chunks (Hybrid RRF / BigQuery VECTOR_SEARCH)
       3. Generate a grounded answer (Gemini 1.5 Pro)
     """
 
@@ -71,9 +71,15 @@ class RAGChain:
 
     # ── Core steps ────────────────────────────────────────────────────────────
 
-    def retrieve(self, query: str) -> list[dict]:
+    def retrieve(self, query: str, hybrid: bool = True) -> list[dict]:
         """Embed the query and fetch the top-k closest document chunks."""
         query_embedding = self.embedder.embed_query(query)
+        if hybrid:
+            return self.vector_store.hybrid_search(
+                query_text=query,
+                query_embedding=query_embedding,
+                top_k=self.top_k,
+            )
         return self.vector_store.similarity_search(query_embedding, top_k=self.top_k)
 
     def generate(self, question: str, context_docs: list[dict]) -> str:
@@ -95,21 +101,22 @@ class RAGChain:
 
     # ── Public interface ──────────────────────────────────────────────────────
 
-    def ask(self, question: str) -> dict:
+    def ask(self, question: str, hybrid: bool = True) -> dict:
         """
         Run the full RAG pipeline for a single question.
 
         Args:
             question: Natural language question from the user.
+            hybrid: Whether to use hybrid search with Reciprocal Rank Fusion.
 
         Returns:
             Dict with keys:
                 question    — the original question
                 answer      — Gemini's grounded answer
-                sources     — list of {id, source, distance} for each retrieved chunk
-                context_docs — full retrieved chunk objects (for inspection/debugging)
+                sources     — list of {id, source, distance/rrf_score} for each chunk
+                context_docs — full retrieved chunk objects
         """
-        docs = self.retrieve(question)
+        docs = self.retrieve(question, hybrid=hybrid)
         answer = self.generate(question, docs)
         return {
             "question": question,
@@ -118,7 +125,7 @@ class RAGChain:
                 {
                     "id": d["id"],
                     "source": d["source"],
-                    "distance": round(d["distance"], 6),
+                    "score": d.get("rrf_score", d.get("distance", 0.0)),
                 }
                 for d in docs
             ],
